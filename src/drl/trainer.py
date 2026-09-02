@@ -1,245 +1,209 @@
+"""
+Algorithm 1 â€“ End-to-end training for DRL.
+
+Faithful implementation of the joint optimisation described in the paper.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from .gradients import (
+    classifier_loss_and_grads,
+    total_domain_loss,
+)
+from .density_ratio import domain_logits_to_probs, density_ratio
+from .predictor import drl_predict, standard_predict
 
 
 class DRLTrainer:
     """
-    DRL training implementation following the structure of
-    Algorithm 1 in the paper.
+    Implements Algorithm 1 of the paper.
 
-    The implementation has three stages per batch:
-
-    1. Train the source/target domain discriminator using Ld.
-    2. Train the classifier using the DRL-weighted source loss.
-    3. Update the density-ratio network using the target-loss
-       gradients from Equation (9).
-
-    This implementation uses our modular classifier and
-    density-ratio network. The paper's exact image-backbone
-    architecture is not specified in the main text.
+    Two distinct parameter groups / optimisers:
+      - opt_domain  updates the domain head (and optionally the backbone)
+      - opt_cls     updates the classification head (and the backbone)
     """
 
     def __init__(
         self,
-        classifier: nn.Module,
-        domain_network: nn.Module,
-        classifier_optimizer: torch.optim.Optimizer,
-        domain_optimizer: torch.optim.Optimizer,
-    ) -> None:
-        self.classifier = classifier
-        self.domain_network = domain_network
+        model: nn.Module,
+        lr_domain: float = 1e-3,
+        lr_cls: float = 1e-3,
+        weight_decay: float = 1e-4,
+        lambda_drl: float = 1.0,
+        r: float = 0.0,
+        device: str | torch.device = "cpu",
+        share_backbone: bool = True,
+    ):
+        self.model = model.to(device)
+        self.device = torch.device(device)
+        self.lambda_drl = lambda_drl
+        self.r = r
+        self.share_backbone = share_backbone
 
-        self.classifier_optimizer = classifier_optimizer
-        self.domain_optimizer = domain_optimizer
+        # Parameter groups matching Algorithm 1
+        domain_params = list(model.domain_head.parameters())
+        cls_params = list(model.classifier.parameters())
+        backbone_params = list(model.backbone.parameters())
 
-        self.domain_loss_fn = nn.CrossEntropyLoss()
+        if share_backbone:
+            # Backbone is updated by both steps (paper allows this)
+            domain_params = domain_params + backbone_params
+            cls_params = cls_params + backbone_params
 
-    @staticmethod
-    def _freeze(model: nn.Module) -> None:
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-
-    @staticmethod
-    def _unfreeze(model: nn.Module) -> None:
-        for parameter in model.parameters():
-            parameter.requires_grad_(True)
-
-    def domain_classification_step(
-        self,
-        source_x: torch.Tensor,
-        target_x: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Optimize Ld, the binary source-vs-target classification loss.
-        """
-
-        self._freeze(self.classifier)
-        self._unfreeze(self.domain_network)
-
-        self.domain_optimizer.zero_grad(set_to_none=True)
-
-        x = torch.cat(
-            [source_x, target_x],
-            dim=0,
+        self.opt_domain = torch.optim.SGD(
+            domain_params, lr=lr_domain, momentum=0.9, weight_decay=weight_decay
+        )
+        self.opt_cls = torch.optim.SGD(
+            cls_params, lr=lr_cls, momentum=0.9, weight_decay=weight_decay
         )
 
-        labels = torch.cat(
+    def _move(self, batch):
+        return tuple(t.to(self.device) for t in batch)
+
+    def train_step(
+        self,
+        src_x: torch.Tensor,
+        src_y: torch.Tensor,
+        tgt_x: torch.Tensor,
+    ) -> Dict[str, float]:
+        """
+        One iteration of Algorithm 1 (lines 5â€“7).
+
+        Returns a dict of scalar losses for logging.
+        """
+        self.model.train()
+        B = src_x.size(0)
+
+        # ------------------------------------------------------------------
+        # 1. Forward pass on the concatenated batch
+        # ------------------------------------------------------------------
+        x_all = torch.cat([src_x, tgt_x], dim=0)
+        domain_labels = torch.cat(
             [
-                torch.zeros(
-                    source_x.shape[0],
-                    dtype=torch.long,
-                    device=source_x.device,
-                ),
-                torch.ones(
-                    target_x.shape[0],
-                    dtype=torch.long,
-                    device=target_x.device,
-                ),
+                torch.zeros(B, dtype=torch.long, device=self.device),
+                torch.ones(B, dtype=torch.long, device=self.device),
             ],
             dim=0,
         )
 
-        domain_logits = self.domain_network(x)
+        feat_all = self.model.extract(x_all)
+        domain_logits = self.model.domain(feat_all)
+        feat_src = feat_all[:B]
+        domain_logits_src = domain_logits[:B]
 
-        loss = self.domain_loss_fn(
-            domain_logits,
-            labels,
+        # ------------------------------------------------------------------
+        # 2. Update domain network (Algorithm 1 step 5)
+        #    gradients from BOTH loss terms of Eq. (7)
+        # ------------------------------------------------------------------
+        self.opt_domain.zero_grad()
+        loss_domain = total_domain_loss(
+            domain_logits=domain_logits,
+            domain_labels=domain_labels,
+            features_src=feat_src,
+            labels_src=src_y,
+            classifier=self.model.classifier,
+            lambda_drl=self.lambda_drl,
+            r=self.r,
         )
+        loss_domain.backward()
+        self.opt_domain.step()
 
-        loss.backward()
-        self.domain_optimizer.step()
-
-        return loss.detach()
-
-    def classifier_step(
-        self,
-        source_x: torch.Tensor,
-        source_y: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Update the classification network using the current
-        density-ratio-adjusted source prediction.
-
-        Equation (8) gives the standard softmax classification
-        gradient structure, with the DRL probabilities used as
-        the current prediction.
-        """
-
-        self._unfreeze(self.classifier)
-        self._freeze(self.domain_network)
-
-        self.classifier_optimizer.zero_grad(set_to_none=True)
-
-        logits = self.classifier(source_x)
-
+        # ------------------------------------------------------------------
+        # 3. Recompute features / domain probs AFTER the domain update
+        #    (the paper computes f with the freshly updated Ï„)
+        # ------------------------------------------------------------------
         with torch.no_grad():
-            domain_probs = self.domain_network.domain_probabilities(
-                source_x
-            )
+            feat_src = self.model.extract(src_x)
+            domain_logits_src = self.model.domain(feat_src)
+            tau_s, tau_t = domain_logits_to_probs(domain_logits_src)
 
-            source_prob = domain_probs[:, 0].clamp_min(1e-8)
-            target_prob = domain_probs[:, 1].clamp_min(1e-8)
-
-            density_ratio = source_prob / target_prob
-
-        ratio = density_ratio.unsqueeze(1)
-
-        # DRL temperature-like scaling from Ps(x) / Pt(x).
-        drl_logits = logits * ratio
-
-        loss = nn.functional.cross_entropy(
-            drl_logits,
-            source_y,
+        # ------------------------------------------------------------------
+        # 4. Update classifier + backbone (Algorithm 1 step 7)
+        #    using the derived source-side gradients
+        # ------------------------------------------------------------------
+        self.opt_cls.zero_grad()
+        # We need a fresh forward that is connected to the graph
+        feat_src = self.model.extract(src_x)
+        loss_cls = classifier_loss_and_grads(
+            features=feat_src,
+            labels=src_y,
+            classifier=self.model.classifier,
+            tau_s=tau_s,
+            tau_t=tau_t,
+            r=self.r,
         )
+        loss_cls.backward()
+        self.opt_cls.step()
 
-        loss.backward()
-        self.classifier_optimizer.step()
-
-        return loss.detach()
-
-    def density_ratio_target_step(
-        self,
-        target_x: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Update the density-ratio network using Equation (9).
-
-        ds = P(source | x)
-        dt = P(target  | x)
-
-        Equation (9):
-
-            grad_ds = E[score] / dt
-
-            grad_dt = -(ds / dt^2) E[score]
-
-        The classifier score is detached here because this stage
-        is intended to supply gradients to the density estimator,
-        not to update the classifier through Equation (9).
-        """
-
-        self._freeze(self.classifier)
-        self._unfreeze(self.domain_network)
-
-        self.domain_optimizer.zero_grad(set_to_none=True)
-
-        domain_probs = self.domain_network.domain_probabilities(
-            target_x
-        )
-
-        ds = domain_probs[:, 0].clamp_min(1e-8)
-        dt = domain_probs[:, 1].clamp_min(1e-8)
-
-        # The classifier score appearing in Equation (9):
-        #
-        # E_{P_hat(y|x)}
-        #   [w · y phi_hat(x) + b]
-        #
-        # Our classifier logits represent:
-        #   w · phi(x) + b
-        #
-        # Therefore the expected score is the probability-weighted
-        # sum of the class logits.
-
+        # ------------------------------------------------------------------
+        # Logging
+        # ------------------------------------------------------------------
         with torch.no_grad():
-            classifier_logits = self.classifier(target_x)
-
-            ratio = (ds / dt).detach()
-
-            drl_logits = classifier_logits * ratio.unsqueeze(1)
-
-            predictions = torch.softmax(
-                drl_logits,
-                dim=1,
-            )
-
-            expected_score = (
-                predictions * classifier_logits
-            ).sum(dim=1).mean()
-
-        dt_safe = dt.clamp_min(1e-8)
-
-        grad_ds = expected_score / dt_safe
-        grad_dt = (
-            -(ds / (dt_safe ** 2))
-            * expected_score
-        )
-
-        torch.autograd.backward(
-            tensors=[ds, dt],
-            grad_tensors=[grad_ds, grad_dt],
-        )
-
-        self.domain_optimizer.step()
-
-        return expected_score.detach()
-
-    def train_step(
-        self,
-        source_x: torch.Tensor,
-        source_y: torch.Tensor,
-        target_x: torch.Tensor,
-    ) -> dict[str, float]:
-        """
-        Perform one complete DRL training step.
-        """
-
-        domain_loss = self.domain_classification_step(
-            source_x,
-            target_x,
-        )
-
-        classification_loss = self.classifier_step(
-            source_x,
-            source_y,
-        )
-
-        target_score = self.density_ratio_target_step(
-            target_x,
-        )
+            ratio = density_ratio(tau_s, tau_t)
+            ratio_stats = {
+                "ratio_mean": ratio.mean().item(),
+                "ratio_std": ratio.std().item(),
+                "ratio_min": ratio.min().item(),
+                "ratio_max": ratio.max().item(),
+            }
 
         return {
-            "domain_loss": float(domain_loss),
-            "classification_loss": float(classification_loss),
-            "target_score": float(target_score),
+            "loss_domain": loss_domain.item(),
+            "loss_cls": loss_cls.item(),
+            **ratio_stats,
         }
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        loader: DataLoader,
+        use_drl: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Compute accuracy, mean confidence and Brier score on a labelled loader.
+        Target labels are used **only** for evaluation, never for training.
+        """
+        self.model.eval()
+        correct = 0
+        total = 0
+        conf_sum = 0.0
+        brier_sum = 0.0
+
+        for x, y in loader:
+            x, y = x.to(self.device), y.to(self.device)
+            feat = self.model.extract(x)
+            if use_drl:
+                domain_logits = self.model.domain(feat)
+                probs = drl_predict(feat, self.model.classifier, domain_logits, r=self.r)
+            else:
+                probs = standard_predict(feat, self.model.classifier)
+
+            pred = probs.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+            conf = probs.max(dim=1).values
+            conf_sum += conf.sum().item()
+
+            # Brier score (multi-class)
+            onehot = F.one_hot(y, num_classes=probs.size(1)).float()
+            brier_sum += ((probs - onehot) ** 2).sum(dim=1).sum().item()
+
+        acc = 100.0 * correct / max(total, 1)
+        mean_conf = conf_sum / max(total, 1)
+        brier = brier_sum / max(total, 1)
+        return {
+            "accuracy": acc,
+            "mean_confidence": mean_conf,
+            "brier": brier,
+            "n": total,
+        }
+
+
+# Convenience import for F.one_hot
+import torch.nn.functional as F
