@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from src.drl.image_gradients import target_loss_density_gradients
+
 
 class ImageDRLTrainer:
     def __init__(
@@ -61,7 +63,6 @@ class ImageDRLTrainer:
         self.classifier_optimizer.zero_grad(set_to_none=True)
 
         source_features = self.model.extract_features(source_x)
-
         source_logits = self.model.classifier.backbone.fc(
             source_features
         )
@@ -88,9 +89,47 @@ class ImageDRLTrainer:
         classification_loss.backward()
         self.classifier_optimizer.step()
 
+        self.domain_optimizer.zero_grad(set_to_none=True)
+
+        target_features = self.model.extract_features(
+            target_x
+        ).detach()
+
+        target_domain_probs = (
+            self.model.domain_network.domain_probabilities(
+                target_features
+            )
+        )
+
+        ds = target_domain_probs[:, 0]
+        dt = target_domain_probs[:, 1]
+
+        with torch.no_grad():
+            target_logits = self.model.classifier.backbone.fc(
+                target_features
+            )
+
+            grad_ds, grad_dt, expected_score = (
+                target_loss_density_gradients(
+                    ds,
+                    dt,
+                    target_logits,
+                )
+            )
+
+        torch.autograd.backward(
+            tensors=[ds, dt],
+            grad_tensors=[grad_ds, grad_dt],
+        )
+
+        self.domain_optimizer.step()
+
         return {
             "domain_loss": float(domain_loss.detach()),
             "classification_loss": float(
                 classification_loss.detach()
+            ),
+            "target_score": float(
+                expected_score.detach()
             ),
         }
