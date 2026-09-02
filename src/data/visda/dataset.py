@@ -6,9 +6,8 @@ from torchvision import transforms
 
 
 class VisDAClassificationDataset(Dataset):
-    def __init__(self, root, train=True):
+    def __init__(self, root):
         self.root = Path(root)
-        self.train = train
 
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -16,7 +15,9 @@ class VisDAClassificationDataset(Dataset):
         ])
 
         self.classes = sorted(
-            [p.name for p in self.root.iterdir() if p.is_dir()]
+            path.name
+            for path in self.root.iterdir()
+            if path.is_dir()
         )
 
         self.class_to_idx = {
