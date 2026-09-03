@@ -123,3 +123,82 @@ class DRSTLoop:
             "remaining_target_x": unlabeled_x,
             "history": history,
         }
+    def run_iteration(
+        self,
+        source_x: torch.Tensor,
+        source_y: torch.Tensor,
+        target_x: torch.Tensor,
+    ) -> dict:
+        result = self.run(
+            source_x=source_x,
+            source_y=source_y,
+            target_x=target_x,
+        )
+
+        first = result["history"][0]
+
+        selected_count = first["selected_count"]
+
+        return {
+            "pseudo_x": result["source_x"][-selected_count:],
+            "pseudo_y": result["source_y"][-selected_count:],
+            "source_x": result["source_x"],
+            "source_y": result["source_y"],
+            "remaining_target_x": result["remaining_target_x"],
+            "training_metrics": first["training_metrics"],
+        }
+    def run_iteration(
+        self,
+        source_x: torch.Tensor,
+        source_y: torch.Tensor,
+        target_x: torch.Tensor,
+    ) -> dict:
+        (
+            selected_indices,
+            pseudo_labels,
+            confidences,
+            probabilities,
+        ) = generate_pseudo_labels(
+            classifier=self.classifier,
+            domain_network=self.domain_network,
+            target_x=target_x,
+            portion=self.pseudo_label_portion,
+        )
+
+        pseudo_x = target_x[selected_indices]
+
+        mask = torch.ones(
+            len(target_x),
+            dtype=torch.bool,
+            device=target_x.device,
+        )
+        mask[selected_indices] = False
+
+        remaining_x = target_x[mask]
+
+        updated_source_x = torch.cat(
+            [source_x, pseudo_x],
+            dim=0,
+        )
+        updated_source_y = torch.cat(
+            [source_y, pseudo_labels],
+            dim=0,
+        )
+
+        training_metrics = None
+
+        if len(remaining_x) > 0:
+            training_metrics = self.trainer.train_step(
+                source_x=updated_source_x,
+                source_y=updated_source_y,
+                target_x=remaining_x,
+            )
+
+        return {
+            "pseudo_x": pseudo_x,
+            "pseudo_y": pseudo_labels,
+            "source_x": updated_source_x,
+            "source_y": updated_source_y,
+            "remaining_target_x": remaining_x,
+            "training_metrics": training_metrics,
+        }
