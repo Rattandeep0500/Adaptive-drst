@@ -11,22 +11,25 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import datasets, transforms
 
+from src.drst.adaptive_selector import adaptive_select_pseudo_labels
+from src.drst.dual_selector import select_dual_reliable_pseudo_labels
+
 
 SEED = 42
 DATA_ROOT = "data/digits"
 
 BATCH_SIZE = 128
 SOURCE_EPOCHS = 10
-ADAPT_EPOCHS = 12
+ADAPT_EPOCHS = 8
+
+MIN_THRESHOLD = 0.70
+MAX_THRESHOLD = 0.95
+
+MAX_PER_CLASS = 500
+DUAL_THRESHOLD = 0.70
 
 EMA_DECAY = 0.99
-CONSISTENCY_WEIGHT = 1.0
-
-MIN_THRESHOLD = 0.80
-MAX_THRESHOLD = 0.97
-
-PSEUDO_REFRESH_EVERY = 1
-MAX_PER_CLASS = 1000
+CONSISTENCY_WEIGHT = 0.5
 
 
 def seed_everything(seed):
@@ -66,21 +69,23 @@ class CNN(nn.Module):
 
 class EMATeacher:
     def __init__(self, student, decay=0.99):
-        self.student = student
         self.teacher = copy.deepcopy(student)
         self.decay = decay
 
-        for p in self.teacher.parameters():
-            p.requires_grad_(False)
+        for parameter in self.teacher.parameters():
+            parameter.requires_grad_(False)
 
     @torch.no_grad()
-    def update(self):
-        for tp, sp in zip(
+    def update(self, student):
+        for teacher_p, student_p in zip(
             self.teacher.parameters(),
-            self.student.parameters(),
+            student.parameters(),
         ):
-            tp.mul_(self.decay)
-            tp.add_(sp, alpha=1.0 - self.decay)
+            teacher_p.mul_(self.decay)
+            teacher_p.add_(
+                student_p,
+                alpha=1.0 - self.decay,
+            )
 
     def eval(self):
         self.teacher.eval()
@@ -127,48 +132,56 @@ def stack_dataset(dataset):
 
     return (
         torch.stack(xs),
-        torch.tensor(ys, dtype=torch.long),
+        torch.tensor(
+            ys,
+            dtype=torch.long,
+        ),
     )
 
 
-def weak_aug(x):
+def weak_augment(x):
     out = x.clone()
 
-    dx = random.randint(-1, 1)
-    dy = random.randint(-1, 1)
+    shift_x = random.randint(-1, 1)
+    shift_y = random.randint(-1, 1)
 
     out = torch.roll(
         out,
-        shifts=(dy, dx),
+        shifts=(shift_y, shift_x),
         dims=(2, 3),
     )
 
-    return out.clamp(0, 1)
+    return out.clamp(0.0, 1.0)
 
 
-def strong_aug(x):
-    out = weak_aug(x)
+def strong_augment(x):
+    out = weak_augment(x)
 
     out = out + 0.05 * torch.randn_like(out)
 
     if random.random() < 0.5:
         out = torch.flip(out, dims=[3])
 
-    if random.random() < 0.5:
-        h = random.randint(2, 5)
-        w = random.randint(2, 5)
-        y0 = random.randint(0, 28 - h)
-        x0 = random.randint(0, 28 - w)
-
-        out[:, :, y0:y0+h, x0:x0+w] = 0
-
-    return out.clamp(0, 1)
+    return out.clamp(0.0, 1.0)
 
 
-def train_source(model, x, y):
-    loader = DataLoader(
-        TensorDataset(x, y),
+def make_loader(x, y=None, shuffle=False):
+    if y is None:
+        dataset = x
+    else:
+        dataset = TensorDataset(x, y)
+
+    return DataLoader(
+        dataset,
         batch_size=BATCH_SIZE,
+        shuffle=shuffle,
+    )
+
+
+def train_source(model, source_x, source_y):
+    loader = make_loader(
+        source_x,
+        source_y,
         shuffle=True,
     )
 
@@ -178,21 +191,19 @@ def train_source(model, x, y):
         weight_decay=1e-4,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=SOURCE_EPOCHS,
-    )
-
     for epoch in range(SOURCE_EPOCHS):
         model.train()
+
         total_loss = 0.0
         steps = 0
 
-        for bx, by in loader:
+        for x, y in loader:
             optimizer.zero_grad(set_to_none=True)
 
-            logits = model(bx)
-            loss = F.cross_entropy(logits, by)
+            loss = F.cross_entropy(
+                model(x),
+                y,
+            )
 
             loss.backward()
             optimizer.step()
@@ -200,12 +211,10 @@ def train_source(model, x, y):
             total_loss += float(loss.detach())
             steps += 1
 
-        scheduler.step()
-
         print(
             f"[SOURCE] "
-            f"{epoch + 1}/{SOURCE_EPOCHS} "
-            f"loss={total_loss / steps:.4f}"
+            f"epoch={epoch + 1}/{SOURCE_EPOCHS} "
+            f"loss={total_loss / max(steps, 1):.4f}"
         )
 
 
@@ -213,219 +222,315 @@ def train_source(model, x, y):
 def predict(model, x):
     model.eval()
 
-    loader = DataLoader(
+    outputs = []
+
+    loader = make_loader(
         x,
-        batch_size=256,
         shuffle=False,
     )
 
-    probs = []
-
-    for bx in loader:
-        probs.append(
+    for batch in loader:
+        outputs.append(
             torch.softmax(
-                model(bx),
+                model(batch),
                 dim=1,
             )
         )
 
-    return torch.cat(probs)
+    return torch.cat(outputs, dim=0)
 
 
 def accuracy(model, x, y):
-    p = predict(model, x)
+    probabilities = predict(model, x)
 
     return float(
-        (p.argmax(1) == y)
-        .float()
-        .mean()
+        (
+            probabilities.argmax(dim=1)
+            == y
+        ).float().mean()
     )
-
-
-def adaptive_thresholds(
-    probabilities,
-    minimum=MIN_THRESHOLD,
-    maximum=MAX_THRESHOLD,
-):
-    confidence, labels = probabilities.max(1)
-
-    thresholds = torch.full(
-        (10,),
-        minimum,
-        dtype=confidence.dtype,
-    )
-
-    for cls in range(10):
-        mask = labels == cls
-
-        if not mask.any():
-            continue
-
-        cls_conf = confidence[mask]
-
-        # Median confidence, bounded globally.
-        thresholds[cls] = torch.quantile(
-            cls_conf,
-            0.50,
-        ).clamp(
-            minimum,
-            maximum,
-        )
-
-    return confidence, labels, thresholds
 
 
 @torch.no_grad()
-def build_pseudo_bank(
-    teacher,
+def build_adaptive_selection(
+    model,
     target_x,
 ):
     probabilities = predict(
-        teacher,
+        model,
         target_x,
     )
 
-    confidence, labels, thresholds = adaptive_thresholds(
-        probabilities
+    return adaptive_select_pseudo_labels(
+        probabilities=probabilities,
+        min_threshold=MIN_THRESHOLD,
+        max_threshold=MAX_THRESHOLD,
+        max_per_class=MAX_PER_CLASS,
     )
 
-    selected = torch.zeros(
-        len(target_x),
-        dtype=torch.bool,
+
+@torch.no_grad()
+def build_dual_selection(
+    model,
+    target_x,
+):
+    logits = []
+
+    domain_inputs = []
+
+    loader = make_loader(
+        target_x,
+        shuffle=False,
     )
 
-    for cls in range(10):
-        mask = (
-            (labels == cls)
-            & (confidence >= thresholds[cls])
+    # Independent support model.
+    support_model = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(28 * 28, 128),
+        nn.ReLU(),
+        nn.Linear(128, 2),
+    )
+
+    # Train the support model against a fixed
+    # source/target representation distribution.
+    # This model is intentionally separate from
+    # the task classifier.
+    return support_model, loader
+
+
+def train_support_model(
+    source_x,
+    target_x,
+):
+    model = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(28 * 28, 128),
+        nn.ReLU(),
+        nn.Linear(128, 2),
+    )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=1e-3,
+    )
+
+    x = torch.cat(
+        [source_x, target_x],
+        dim=0,
+    )
+
+    y = torch.cat(
+        [
+            torch.zeros(
+                len(source_x),
+                dtype=torch.long,
+            ),
+            torch.ones(
+                len(target_x),
+                dtype=torch.long,
+            ),
+        ],
+        dim=0,
+    )
+
+    loader = make_loader(
+        x,
+        y,
+        shuffle=True,
+    )
+
+    model.train()
+
+    for _ in range(3):
+        for bx, by in loader:
+            optimizer.zero_grad(set_to_none=True)
+
+            loss = F.cross_entropy(
+                model(bx),
+                by,
+            )
+
+            loss.backward()
+            optimizer.step()
+
+    return model
+
+
+@torch.no_grad()
+def dual_selection(
+    task_model,
+    support_model,
+    target_x,
+):
+    task_model.eval()
+    support_model.eval()
+
+    task_probabilities = predict(
+        task_model,
+        target_x,
+    )
+
+    support_probabilities = []
+
+    loader = make_loader(
+        target_x,
+        shuffle=False,
+    )
+
+    for batch in loader:
+        support_probabilities.append(
+            torch.softmax(
+                support_model(batch),
+                dim=1,
+            )
         )
 
-        idx = torch.where(mask)[0]
+    support_probabilities = torch.cat(
+        support_probabilities,
+        dim=0,
+    )
 
-        if idx.numel() > MAX_PER_CLASS:
-            order = torch.argsort(
-                confidence[idx],
-                descending=True,
-            )
-            idx = idx[order[:MAX_PER_CLASS]]
-
-        selected[idx] = True
-
-    return {
-        "selected": selected,
-        "labels": labels,
-        "confidence": confidence,
-        "thresholds": thresholds,
-        "probabilities": probabilities,
-    }
+    return select_dual_reliable_pseudo_labels(
+        drl_probabilities=task_probabilities,
+        domain_probabilities=support_probabilities,
+        threshold=DUAL_THRESHOLD,
+        max_per_class=MAX_PER_CLASS,
+    )
 
 
-def adapt(
-    student,
+def run_consistency(
+    model,
     teacher,
     source_x,
     source_y,
     target_x,
-    test_x,
-    test_y,
+    selector,
+    support_model=None,
 ):
+    source_loader = make_loader(
+        source_x,
+        source_y,
+        shuffle=True,
+    )
+
     optimizer = torch.optim.AdamW(
-        student.parameters(),
+        model.parameters(),
         lr=5e-4,
         weight_decay=1e-4,
     )
 
-    source_loader = DataLoader(
-        TensorDataset(source_x, source_y),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-    )
-
     for epoch in range(ADAPT_EPOCHS):
-        teacher.eval()
+        if selector == "adaptive":
+            (
+                selected,
+                pseudo_y,
+                confidence,
+                thresholds,
+            ) = build_adaptive_selection(
+                teacher.teacher,
+                target_x,
+            )
 
-        bank = build_pseudo_bank(
-            teacher.teacher,
-            target_x,
+            support = None
+            score = confidence
+
+        else:
+            (
+                selected,
+                pseudo_y,
+                confidence,
+                support,
+                score,
+            ) = dual_selection(
+                teacher.teacher,
+                support_model,
+                target_x,
+            )
+
+            thresholds = None
+
+        selected_mask = torch.zeros(
+            len(target_x),
+            dtype=torch.bool,
         )
+        selected_mask[selected] = True
 
-        selected_mask = bank["selected"]
-        pseudo_labels = bank["labels"]
-
-        selected_ids = torch.where(
-            selected_mask
-        )[0]
-
-        print(
-            f"[ADAPT] epoch {epoch + 1}/{ADAPT_EPOCHS} "
-            f"pseudo={len(selected_ids)}"
+        pseudo_bank = torch.full(
+            (len(target_x),),
+            -1,
+            dtype=torch.long,
         )
-
-        total_loss = 0.0
-        steps = 0
+        pseudo_bank[selected] = pseudo_y
 
         target_order = torch.randperm(
             len(target_x)
         )
 
-        target_ptr = 0
+        pointer = 0
 
-        student.train()
+        total_loss = 0.0
+        selected_seen = 0
+        steps = 0
+
+        model.train()
 
         for sx, sy in source_loader:
-            if target_ptr >= len(target_x):
-                target_ptr = 0
+            if pointer >= len(target_x):
+                pointer = 0
                 target_order = torch.randperm(
                     len(target_x)
                 )
 
             end = min(
-                target_ptr + BATCH_SIZE,
+                pointer + BATCH_SIZE,
                 len(target_x),
             )
 
             ids = target_order[
-                target_ptr:end
+                pointer:end
             ]
 
-            target_ptr = end
+            pointer = end
 
             tx = target_x[ids]
 
-            weak = weak_aug(tx)
-            strong = strong_aug(tx)
-
-            source_logits = student(sx)
-
             source_loss = F.cross_entropy(
-                source_logits,
+                model(sx),
                 sy,
             )
 
-            consistency_loss = torch.tensor(
-                0.0
+            local_mask = selected_mask[ids]
+
+            consistency_loss = torch.zeros(
+                (),
+                device=sx.device,
             )
 
-            local_selected = (
-                selected_mask[ids]
-            )
+            if local_mask.any():
+                weak = weak_augment(tx)
+                strong = strong_augment(tx)
 
-            if local_selected.any():
-                global_ids = ids[
-                    local_selected
-                ]
+                with torch.no_grad():
+                    weak_teacher = teacher.teacher(
+                        weak[local_mask]
+                    ).softmax(dim=1)
 
-                pseudo_y = pseudo_labels[
-                    global_ids
-                ]
-
-                strong_logits = student(
-                    strong[local_selected]
+                strong_logits = model(
+                    strong[local_mask]
                 )
+
+                local_ids = ids[local_mask]
+                labels = pseudo_bank[
+                    local_ids
+                ]
 
                 consistency_loss = F.cross_entropy(
                     strong_logits,
-                    pseudo_y,
+                    labels,
+                )
+
+                selected_seen += int(
+                    local_mask.sum()
                 )
 
             loss = (
@@ -434,53 +539,88 @@ def adapt(
                 * consistency_loss
             )
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(
+                set_to_none=True
+            )
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                student.parameters(),
-                5.0,
-            )
 
             optimizer.step()
 
-            teacher.update()
+            teacher.update(model)
 
-            total_loss += float(loss.detach())
+            total_loss += float(
+                loss.detach()
+            )
             steps += 1
 
-        test_accuracy = accuracy(
+        target_acc = accuracy(
             teacher.teacher,
-            test_x,
-            test_y,
+            TARGET_TEST_X,
+            TARGET_TEST_Y,
         )
 
         print(
-            f"[ADAPT] epoch {epoch + 1}/{ADAPT_EPOCHS} "
-            f"loss={total_loss / steps:.4f} "
-            f"target_acc={test_accuracy * 100:.2f}%"
+            f"[{selector.upper()}] "
+            f"epoch={epoch + 1}/{ADAPT_EPOCHS} "
+            f"selected={len(selected)} "
+            f"used={selected_seen} "
+            f"loss={total_loss / max(steps, 1):.4f} "
+            f"target_acc={target_acc * 100:.2f}%"
         )
+
+        if thresholds is not None:
+            print(
+                "  thresholds:",
+                [
+                    round(float(v), 3)
+                    for v in thresholds
+                ],
+            )
+
+        if selector == "dual" and len(score) > 0:
+            print(
+                f"  mean dual score="
+                f"{float(score.mean()):.4f}"
+            )
 
 
 def main():
+    global TARGET_TEST_X
+    global TARGET_TEST_Y
+
     seed_everything(SEED)
 
     print("Loading MNIST -> USPS...")
 
-    mnist, usps_train, usps_test = load_data()
+    (
+        mnist,
+        usps_train,
+        usps_test,
+    ) = load_data()
 
-    source_x, source_y = stack_dataset(mnist)
-    target_x, _ = stack_dataset(usps_train)
-    test_x, test_y = stack_dataset(usps_test)
+    source_x, source_y = stack_dataset(
+        mnist
+    )
+
+    target_x, _ = stack_dataset(
+        usps_train
+    )
+
+    TARGET_TEST_X, TARGET_TEST_Y = (
+        stack_dataset(usps_test)
+    )
 
     print(
         f"Source train: {len(source_x)}"
     )
+
     print(
         f"Target adaptation: {len(target_x)}"
     )
+
     print(
-        f"Target test: {len(test_x)}"
+        f"Target test: {len(TARGET_TEST_X)}"
     )
 
     print("\n=== SOURCE-ONLY ===")
@@ -493,59 +633,110 @@ def main():
         source_y,
     )
 
-    source_accuracy = accuracy(
+    source_acc = accuracy(
         source_model,
-        test_x,
-        test_y,
+        TARGET_TEST_X,
+        TARGET_TEST_Y,
     )
 
     print(
         f"Source-only target accuracy: "
-        f"{source_accuracy * 100:.2f}%"
+        f"{source_acc * 100:.2f}%"
     )
 
-    print("\n=== ADAPTIVE-DRST-EMA ===")
+    print("\n=== ADAPTIVE-CB + EMA ===")
 
-    student = copy.deepcopy(
+    adaptive_student = copy.deepcopy(
         source_model
     )
 
-    teacher = EMATeacher(
-        student,
+    adaptive_teacher = EMATeacher(
+        adaptive_student,
         decay=EMA_DECAY,
     )
 
-    adapt(
-        student=student,
-        teacher=teacher,
-        source_x=source_x,
-        source_y=source_y,
-        target_x=target_x,
-        test_x=test_x,
-        test_y=test_y,
+    run_consistency(
+        adaptive_student,
+        adaptive_teacher,
+        source_x,
+        source_y,
+        target_x,
+        selector="adaptive",
     )
 
-    final_accuracy = accuracy(
-        teacher.teacher,
-        test_x,
-        test_y,
-    )
-
-    print("\n=== FINAL ===")
-
-    print(
-        f"Source-only : "
-        f"{source_accuracy * 100:.2f}%"
+    adaptive_acc = accuracy(
+        adaptive_teacher.teacher,
+        TARGET_TEST_X,
+        TARGET_TEST_Y,
     )
 
     print(
-        f"Adaptive-DRST: "
-        f"{final_accuracy * 100:.2f}%"
+        f"Adaptive-CB final: "
+        f"{adaptive_acc * 100:.2f}%"
+    )
+
+    print("\n=== DUAL-RELIABILITY ===")
+
+    support_model = train_support_model(
+        source_x,
+        target_x,
+    )
+
+    dual_student = copy.deepcopy(
+        source_model
+    )
+
+    dual_teacher = EMATeacher(
+        dual_student,
+        decay=EMA_DECAY,
+    )
+
+    run_consistency(
+        dual_student,
+        dual_teacher,
+        source_x,
+        source_y,
+        target_x,
+        selector="dual",
+        support_model=support_model,
+    )
+
+    dual_acc = accuracy(
+        dual_teacher.teacher,
+        TARGET_TEST_X,
+        TARGET_TEST_Y,
     )
 
     print(
-        f"Gain: "
-        f"{(final_accuracy - source_accuracy) * 100:+.2f} pp"
+        f"Dual-Reliability final: "
+        f"{dual_acc * 100:.2f}%"
+    )
+
+    print("\n=== FINAL COMPARISON ===")
+
+    print(
+        f"Source-only       : "
+        f"{source_acc * 100:.2f}%"
+    )
+
+    print(
+        f"Adaptive-CB + EMA : "
+        f"{adaptive_acc * 100:.2f}%"
+    )
+
+    print(
+        f"Dual-Reliability  : "
+        f"{dual_acc * 100:.2f}%"
+    )
+
+    print(
+        f"Dual gain vs source: "
+        f"{(dual_acc - source_acc) * 100:+.2f} pp"
+    )
+
+    print(
+        f"Dual gain vs Adaptive-CB: "
+        f"{(dual_acc - adaptive_acc) * 100:+.2f} pp"
     )
 
 

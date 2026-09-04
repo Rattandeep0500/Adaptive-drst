@@ -4,19 +4,17 @@ import torch.nn as nn
 
 class DRLTrainer:
     """
-    DRL training implementation following the structure of
-    Algorithm 1 in the paper.
+    Faithful DRL training structure.
 
-    The implementation has three stages per batch:
+    Per minibatch:
 
-    1. Train the source/target domain discriminator using Ld.
-    2. Train the classifier using the DRL-weighted source loss.
-    3. Update the density-ratio network using the target-loss
-       gradients from Equation (9).
+    1. Accumulate the Eq. 9 task gradient into the domain network.
+    2. Accumulate the binary source-vs-target domain-loss gradient.
+    3. Perform ONE domain-network optimizer step.
+    4. Recompute the DRL ratio using the updated domain network.
+    5. Update the classifier using the fresh DRL ratio.
 
-    This implementation uses our modular classifier and
-    density-ratio network. The paper's exact image-backbone
-    architecture is not specified in the main text.
+    The classifier and domain networks remain separate.
     """
 
     def __init__(
@@ -44,26 +42,12 @@ class DRLTrainer:
         for parameter in model.parameters():
             parameter.requires_grad_(True)
 
-    def domain_classification_step(
+    def _domain_labels(
         self,
         source_x: torch.Tensor,
         target_x: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Optimize Ld, the binary source-vs-target classification loss.
-        """
-
-        self._freeze(self.classifier)
-        self._unfreeze(self.domain_network)
-
-        self.domain_optimizer.zero_grad(set_to_none=True)
-
-        x = torch.cat(
-            [source_x, target_x],
-            dim=0,
-        )
-
-        labels = torch.cat(
+        return torch.cat(
             [
                 torch.zeros(
                     source_x.shape[0],
@@ -77,6 +61,213 @@ class DRLTrainer:
                 ),
             ],
             dim=0,
+        )
+
+    def _domain_batch(
+        self,
+        source_x: torch.Tensor,
+        target_x: torch.Tensor,
+    ):
+        x = torch.cat(
+            [source_x, target_x],
+            dim=0,
+        )
+
+        labels = self._domain_labels(
+            source_x,
+            target_x,
+        )
+
+        return x, labels
+
+    def _expected_score(
+        self,
+        target_x: torch.Tensor,
+        ds: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Expected unscaled classifier score used by Eq. 9.
+
+        Important:
+        this is based on the classifier logits themselves,
+        NOT the DRL-scaled logits and NOT post-softmax
+        probabilities as the score.
+        """
+
+        with torch.no_grad():
+            classifier_logits = self.classifier(
+                target_x
+            )
+
+            ratio = (
+                ds / dt.clamp_min(1e-8)
+            )
+
+            drl_logits = (
+                classifier_logits
+                * ratio.unsqueeze(1)
+            )
+
+            probabilities = torch.softmax(
+                drl_logits,
+                dim=1,
+            )
+
+            expected_score = (
+                probabilities
+                * classifier_logits
+            ).sum(dim=1).mean()
+
+        return expected_score
+
+    def domain_task_gradient_step(
+        self,
+        target_x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Accumulate Eq. 9 gradients without stepping.
+
+        This method intentionally does NOT call optimizer.step().
+        It exists so the Eq. 9 gradient and domain classification
+        gradient can be accumulated before exactly one domain update.
+        """
+
+        self._freeze(self.classifier)
+        self._unfreeze(self.domain_network)
+
+        domain_probs = (
+            self.domain_network.domain_probabilities(
+                target_x
+            )
+        )
+
+        ds = domain_probs[:, 0].clamp_min(
+            1e-8
+        )
+        dt = domain_probs[:, 1].clamp_min(
+            1e-8
+        )
+
+        expected_score = self._expected_score(
+            target_x,
+            ds,
+            dt,
+        )
+
+        dt_safe = dt.clamp_min(1e-8)
+
+        grad_ds = (
+            expected_score / dt_safe
+        )
+
+        grad_dt = (
+            -(
+                ds
+                / (dt_safe ** 2)
+            )
+            * expected_score
+        )
+
+        torch.autograd.backward(
+            tensors=[ds, dt],
+            grad_tensors=[grad_ds, grad_dt],
+        )
+
+        return expected_score.detach()
+
+    def domain_classification_loss(
+        self,
+        source_x: torch.Tensor,
+        target_x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the domain classification loss.
+
+        This method accumulates its gradient into the domain
+        network but does not perform the optimizer step.
+        """
+
+        self._freeze(self.classifier)
+        self._unfreeze(self.domain_network)
+
+        x, labels = self._domain_batch(
+            source_x,
+            target_x,
+        )
+
+        domain_logits = self.domain_network(x)
+
+        loss = self.domain_loss_fn(
+            domain_logits,
+            labels,
+        )
+
+        loss.backward()
+
+        return loss.detach()
+
+    def domain_update(
+        self,
+        source_x: torch.Tensor,
+        target_x: torch.Tensor,
+    ):
+        """
+        Perform the complete discriminator-first phase.
+
+        Eq. 9 gradient + domain classification gradient
+        are accumulated before ONE domain optimizer step.
+        """
+
+        self._freeze(self.classifier)
+        self._unfreeze(self.domain_network)
+
+        self.domain_optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        target_score = (
+            self.domain_task_gradient_step(
+                target_x
+            )
+        )
+
+        domain_loss = (
+            self.domain_classification_loss(
+                source_x,
+                target_x,
+            )
+        )
+
+        self.domain_optimizer.step()
+
+        return (
+            domain_loss,
+            target_score,
+        )
+
+    def domain_classification_step(
+        self,
+        source_x: torch.Tensor,
+        target_x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compatibility API.
+
+        Unlike train_step(), this method performs only the
+        standalone domain-classification optimization.
+        """
+
+        self._freeze(self.classifier)
+        self._unfreeze(self.domain_network)
+
+        self.domain_optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        x, labels = self._domain_batch(
+            source_x,
+            target_x,
         )
 
         domain_logits = self.domain_network(x)
@@ -97,35 +288,49 @@ class DRLTrainer:
         source_y: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Update the classification network using the current
-        density-ratio-adjusted source prediction.
+        Compatibility API.
 
-        Equation (8) gives the standard softmax classification
-        gradient structure, with the DRL probabilities used as
-        the current prediction.
+        Uses the CURRENT domain network and therefore a fresh
+        density ratio at the time this method is called.
         """
 
         self._unfreeze(self.classifier)
         self._freeze(self.domain_network)
 
-        self.classifier_optimizer.zero_grad(set_to_none=True)
+        self.classifier_optimizer.zero_grad(
+            set_to_none=True
+        )
 
-        logits = self.classifier(source_x)
+        logits = self.classifier(
+            source_x
+        )
 
         with torch.no_grad():
-            domain_probs = self.domain_network.domain_probabilities(
-                source_x
+            domain_probs = (
+                self.domain_network.domain_probabilities(
+                    source_x
+                )
             )
 
-            source_prob = domain_probs[:, 0].clamp_min(1e-8)
-            target_prob = domain_probs[:, 1].clamp_min(1e-8)
+            source_prob = (
+                domain_probs[:, 0]
+                .clamp_min(1e-8)
+            )
 
-            density_ratio = source_prob / target_prob
+            target_prob = (
+                domain_probs[:, 1]
+                .clamp_min(1e-8)
+            )
 
-        ratio = density_ratio.unsqueeze(1)
+            density_ratio = (
+                source_prob
+                / target_prob
+            )
 
-        # DRL temperature-like scaling from Ps(x) / Pt(x).
-        drl_logits = logits * ratio
+            drl_logits = (
+                logits
+                * density_ratio.unsqueeze(1)
+            )
 
         loss = nn.functional.cross_entropy(
             drl_logits,
@@ -142,77 +347,29 @@ class DRLTrainer:
         target_x: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Update the density-ratio network using Equation (9).
+        Compatibility API for the standalone Eq. 9 step.
 
-        ds = P(source | x)
-        dt = P(target  | x)
-
-        Equation (9):
-
-            grad_ds = E[score] / dt
-
-            grad_dt = -(ds / dt^2) E[score]
-
-        The classifier score is detached here because this stage
-        is intended to supply gradients to the density estimator,
-        not to update the classifier through Equation (9).
+        The combined train_step() should be preferred because
+        the faithful algorithm accumulates Eq. 9 with the domain
+        classification gradient before one domain update.
         """
 
         self._freeze(self.classifier)
         self._unfreeze(self.domain_network)
 
-        self.domain_optimizer.zero_grad(set_to_none=True)
-
-        domain_probs = self.domain_network.domain_probabilities(
-            target_x
+        self.domain_optimizer.zero_grad(
+            set_to_none=True
         )
 
-        ds = domain_probs[:, 0].clamp_min(1e-8)
-        dt = domain_probs[:, 1].clamp_min(1e-8)
-
-        # The classifier score appearing in Equation (9):
-        #
-        # E_{P_hat(y|x)}
-        #   [w · y phi_hat(x) + b]
-        #
-        # Our classifier logits represent:
-        #   w · phi(x) + b
-        #
-        # Therefore the expected score is the probability-weighted
-        # sum of the class logits.
-
-        with torch.no_grad():
-            classifier_logits = self.classifier(target_x)
-
-            ratio = (ds / dt).detach()
-
-            drl_logits = classifier_logits * ratio.unsqueeze(1)
-
-            predictions = torch.softmax(
-                drl_logits,
-                dim=1,
+        target_score = (
+            self.domain_task_gradient_step(
+                target_x
             )
-
-            expected_score = (
-                predictions * classifier_logits
-            ).sum(dim=1).mean()
-
-        dt_safe = dt.clamp_min(1e-8)
-
-        grad_ds = expected_score / dt_safe
-        grad_dt = (
-            -(ds / (dt_safe ** 2))
-            * expected_score
-        )
-
-        torch.autograd.backward(
-            tensors=[ds, dt],
-            grad_tensors=[grad_ds, grad_dt],
         )
 
         self.domain_optimizer.step()
 
-        return expected_score.detach()
+        return target_score
 
     def train_step(
         self,
@@ -221,25 +378,122 @@ class DRLTrainer:
         target_x: torch.Tensor,
     ) -> dict[str, float]:
         """
-        Perform one complete DRL training step.
+        One faithful DRL minibatch.
+
+        Correct ordering:
+
+            Eq. 9 gradient
+                    +
+            domain BCE gradient
+                    |
+                    v
+            one domain update
+                    |
+                    v
+            fresh ratio
+                    |
+                    v
+            classifier update
         """
 
-        domain_loss = self.domain_classification_step(
-            source_x,
-            target_x,
+        if source_x.ndim < 2:
+            raise ValueError(
+                "source_x must contain a batch dimension"
+            )
+
+        if target_x.ndim < 2:
+            raise ValueError(
+                "target_x must contain a batch dimension"
+            )
+
+        if source_x.shape[0] == 0:
+            raise ValueError(
+                "source_x cannot be empty"
+            )
+
+        if target_x.shape[0] == 0:
+            raise ValueError(
+                "target_x cannot be empty"
+            )
+
+        if source_y.shape[0] != source_x.shape[0]:
+            raise ValueError(
+                "source_x and source_y batch sizes must match"
+            )
+
+        # --------------------------------------------------
+        # 1-3. Domain network:
+        #      Eq. 9 + domain classification, then ONE step.
+        # --------------------------------------------------
+
+        domain_loss, target_score = (
+            self.domain_update(
+                source_x=source_x,
+                target_x=target_x,
+            )
         )
 
-        classification_loss = self.classifier_step(
-            source_x,
-            source_y,
+        # --------------------------------------------------
+        # 4-5. Recompute the DRL ratio using the UPDATED
+        #      domain network, then update the classifier.
+        # --------------------------------------------------
+
+        self._unfreeze(self.classifier)
+        self._freeze(self.domain_network)
+
+        self.classifier_optimizer.zero_grad(
+            set_to_none=True
         )
 
-        target_score = self.density_ratio_target_step(
-            target_x,
+        source_logits = self.classifier(
+            source_x
         )
+
+        with torch.no_grad():
+            updated_domain_probs = (
+                self.domain_network.domain_probabilities(
+                    source_x
+                )
+            )
+
+            source_prob = (
+                updated_domain_probs[:, 0]
+                .clamp_min(1e-8)
+            )
+
+            target_prob = (
+                updated_domain_probs[:, 1]
+                .clamp_min(1e-8)
+            )
+
+            density_ratio = (
+                source_prob
+                / target_prob
+            )
+
+        drl_logits = (
+            source_logits
+            * density_ratio.unsqueeze(1)
+        )
+
+        classification_loss = (
+            nn.functional.cross_entropy(
+                drl_logits,
+                source_y,
+            )
+        )
+
+        classification_loss.backward()
+        self.classifier_optimizer.step()
 
         return {
-            "domain_loss": float(domain_loss),
-            "classification_loss": float(classification_loss),
-            "target_score": float(target_score),
+            "domain_loss": float(
+                domain_loss
+            ),
+            "classification_loss": float(
+                classification_loss.detach()
+            ),
+            "target_score": float(
+                target_score
+            ),
         }
