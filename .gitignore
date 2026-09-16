@@ -7,3 +7,10 @@ checkpoints/
 .venv/
 venv/
 .env
+domains/materials/realmat_bag/cif_file.zip
+
+domains/materials/realmat_bag/data/
+
+domains/materials/realmat_bag/features/*.parquet
+
+domains/materials/realmat_bag/features/structure_feature_failures.json
