@@ -1,0 +1,7 @@
+feature,controlled_values,stressed_values,shared_values,shared_value_count
+solution_ph,"[3.0, 5.0, 5.45, 7.0, 9.0]",[7.0],[7.0],1
+dye_conc_mg/l,"[5, 10, 20, 40, 80]",[5],[5],1
+light_intensity_watt,"[0, 25, 55, 105]",[105],[105],1
+light_source_dist_cm,[12],[12],[12],1
+loading_g,"[0.05, 0.1, 0.15, 0.2, 0.25]",[0.15],[0.15],1
+volume_l,[0.1],[0.1],[0.1],1

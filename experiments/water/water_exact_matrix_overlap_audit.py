@@ -11,68 +11,94 @@ INPUT = RESULTS / "dye_removal_endpoints_collapsed.csv"
 OUTPUT = RESULTS / "exact_matrix_overlap_audit.csv"
 
 
-def norm(x):
+def text_norm(x):
     if pd.isna(x):
-        return "__NA__"
+        return ""
     return re.sub(r"\s+", " ", str(x).strip().lower())
 
 
-def canon(series):
+def canonicalize(series):
     if pd.api.types.is_numeric_dtype(series):
-        x = pd.to_numeric(series, errors="coerce")
-        return x.map(
-            lambda v: "__NA__"
-            if pd.isna(v)
-            else format(float(v), ".12g")
+        values = pd.to_numeric(series, errors="coerce")
+        return values.map(
+            lambda x: "__NA__"
+            if pd.isna(x)
+            else format(float(x), ".12g")
         )
 
-    return series.map(norm)
+    return (
+        series.astype("string")
+        .fillna("__NA__")
+        .str.strip()
+        .str.lower()
+    )
 
 
-def matrix_stressed(row):
-    ha = pd.to_numeric(
-        pd.Series([row["ha_mg/l"]]),
-        errors="coerce"
-    ).iloc[0]
+def no_anion(value):
+    if pd.isna(value):
+        return True
 
-    ha_flag = bool(pd.notna(ha) and ha > 0)
+    value = text_norm(value)
 
-    anion = norm(row["anions"])
-
-    anion_flag = anion not in {
-        "__na__",
+    return value in {
         "",
-        "none",
+        "na",
+        "n/a",
         "nan",
+        "none",
         "0",
         "control",
         "no anion",
         "no anions",
     }
 
-    return ha_flag or anion_flag
+
+def no_ha(value):
+    if pd.isna(value):
+        return True
+
+    try:
+        return float(value) <= 0.0
+    except Exception:
+        value = text_norm(value)
+        return value in {
+            "",
+            "na",
+            "n/a",
+            "nan",
+            "none",
+            "0",
+            "control",
+        }
 
 
-def build_signature(df, columns):
-    tmp = pd.DataFrame(index=df.index)
+def is_matrix_stressed(row):
+    return not (
+        no_ha(row["ha_mg/l"])
+        and no_anion(row["anions"])
+    )
+
+
+def make_signature(df, columns):
+    canonical = pd.DataFrame(index=df.index)
 
     for col in columns:
-        tmp[col] = canon(df[col])
+        canonical[col] = canonicalize(df[col])
 
     return pd.util.hash_pandas_object(
-        tmp,
+        canonical,
         index=False,
     ).astype("uint64")
 
 
 def main():
     print("=" * 100)
-    print("ADAPTIVE-DRST EXACT WATER-MATRIX OVERLAP AUDIT")
+    print("ADAPTIVE-DRST EXACT WATER-MATRIX OVERLAP AUDIT - CORRECTED")
     print("=" * 100)
 
     if not INPUT.exists():
         raise FileNotFoundError(
-            f"Missing endpoint dataset: {INPUT}"
+            f"Missing input file: {INPUT}"
         )
 
     df = pd.read_csv(INPUT)
@@ -92,31 +118,83 @@ def main():
             f"Missing required columns: {missing}"
         )
 
-    df["_dye"] = df["dye"].map(norm)
-    df["_catalyst"] = df["catalyst"].map(norm)
-    df["_matrix_stressed"] = df.apply(
-        matrix_stressed,
+    df["_dye_norm"] = df["dye"].map(text_norm)
+    df["_catalyst_norm"] = df["catalyst"].map(text_norm)
+
+    df["_matrix_stressed_recomputed"] = df.apply(
+        is_matrix_stressed,
         axis=1,
     )
 
+    print()
+    print("FULL ENDPOINT MATRIX DOMAIN")
+    print("-" * 100)
+    print(
+        df["_matrix_stressed_recomputed"]
+        .map({
+            False: "controlled",
+            True: "matrix-stressed",
+        })
+        .value_counts()
+        .to_string()
+    )
+
     matched = df[
-        (df["_dye"] == "melachite green")
+        (df["_dye_norm"] == "melachite green")
         &
-        (df["_catalyst"] == "2 wt% pd-bfo")
+        (df["_catalyst_norm"] == "2 wt% pd-bfo")
+    ].copy()
+
+    controlled = matched[
+        ~matched["_matrix_stressed_recomputed"]
+    ].copy()
+
+    stressed = matched[
+        matched["_matrix_stressed_recomputed"]
     ].copy()
 
     print()
-    print(f"Matched Melachite Green + 2 wt% Pd-BFO: {len(matched)}")
+    print("=" * 100)
+    print("MATCHED COHORT CHECK")
+    print("=" * 100)
+    print(f"Matched total: {len(matched)}")
+    print(f"Controlled: {len(controlled)}")
+    print(f"Matrix-stressed: {len(stressed)}")
+
+    if len(matched) != 25:
+        raise RuntimeError(
+            f"Expected matched cohort N=25, found {len(matched)}"
+        )
+
+    if len(controlled) != 16:
+        raise RuntimeError(
+            f"Expected 16 controlled experiments, found {len(controlled)}"
+        )
+
+    if len(stressed) != 9:
+        raise RuntimeError(
+            f"Expected 9 matrix-stressed experiments, found {len(stressed)}"
+        )
+
+    print()
+    print("CONTROLLED HA / ANION CONDITIONS")
+    print("-" * 100)
     print(
-        f"Controlled: "
-        f"{(~matched['_matrix_stressed']).sum()}"
-    )
-    print(
-        f"Matrix-stressed: "
-        f"{matched['_matrix_stressed'].sum()}"
+        controlled[
+            ["ha_mg/l", "anions"]
+        ].value_counts(dropna=False).to_string()
     )
 
-    exclude = {
+    print()
+    print("MATRIX-STRESSED HA / ANION CONDITIONS")
+    print("-" * 100)
+    print(
+        stressed[
+            ["ha_mg/l", "anions"]
+        ].value_counts(dropna=False).to_string()
+    )
+
+    excluded = {
         "ha_mg/l",
         "anions",
         "time_m",
@@ -128,47 +206,55 @@ def main():
         "_endpoint_rows",
         "_matrix_stressed",
         "_matrix_domain",
-        "_dye",
-        "_catalyst",
+        "_matrix_stressed_recomputed",
+        "_dye_norm",
+        "_catalyst_norm",
     }
 
-    feature_columns = [
-        c for c in matched.columns
-        if c not in exclude
-        and not c.startswith("_")
+    signature_columns = [
+        col
+        for col in matched.columns
+        if col not in excluded
+        and not col.startswith("_")
     ]
 
     print()
-    print("NON-MATRIX VARIABLES HELD FIXED IN EXACT MATCH")
-    print("-" * 100)
+    print("=" * 100)
+    print("NON-MATRIX VARIABLES REQUIRED FOR EXACT OVERLAP")
+    print("=" * 100)
 
-    for col in feature_columns:
+    for col in signature_columns:
         print(col)
 
-    matched["_signature"] = build_signature(
+    matched["_exact_signature"] = make_signature(
         matched,
-        feature_columns,
+        signature_columns,
     )
 
-    control = matched[
-        ~matched["_matrix_stressed"]
+    controlled = matched[
+        ~matched["_matrix_stressed_recomputed"]
     ].copy()
 
     stressed = matched[
-        matched["_matrix_stressed"]
+        matched["_matrix_stressed_recomputed"]
     ].copy()
 
-    control_signatures = set(control["_signature"])
-    stressed_signatures = set(stressed["_signature"])
+    control_signatures = set(
+        controlled["_exact_signature"].tolist()
+    )
+
+    stressed_signatures = set(
+        stressed["_exact_signature"].tolist()
+    )
 
     shared = control_signatures & stressed_signatures
 
-    exact_control = control[
-        control["_signature"].isin(shared)
+    exact_controlled = controlled[
+        controlled["_exact_signature"].isin(shared)
     ].copy()
 
     exact_stressed = stressed[
-        stressed["_signature"].isin(shared)
+        stressed["_exact_signature"].isin(shared)
     ].copy()
 
     print()
@@ -176,13 +262,21 @@ def main():
     print("EXACT NON-MATRIX COVARIATE OVERLAP")
     print("=" * 100)
 
-    print(f"Controlled unique signatures: {len(control_signatures)}")
-    print(f"Stressed unique signatures: {len(stressed_signatures)}")
+    print(
+        f"Controlled unique signatures: "
+        f"{len(control_signatures)}"
+    )
+
+    print(
+        f"Stressed unique signatures: "
+        f"{len(stressed_signatures)}"
+    )
+
     print(f"Shared signatures: {len(shared)}")
 
     print(
         f"Controlled samples inside exact overlap: "
-        f"{len(exact_control)}"
+        f"{len(exact_controlled)}"
     )
 
     print(
@@ -190,40 +284,72 @@ def main():
         f"{len(exact_stressed)}"
     )
 
-    if not shared:
-        print()
-        print(
-            "RESULT: There are NO controlled and matrix-stressed "
-            "experiments with all other recorded experimental "
-            "conditions held exactly constant."
-        )
-
-        print()
-        print(
-            "Therefore the 16 -> 9 split remains observationally "
-            "confounded and should NOT be treated as a clean "
-            "water-matrix domain-adaptation benchmark."
-        )
-
-        return
-
-    rows = []
+    key_process_columns = [
+        col
+        for col in [
+            "solution_ph",
+            "dye_conc_mg/l",
+            "light_intensity_watt",
+            "light_source_dist_cm",
+            "loading_g",
+            "volume_l",
+        ]
+        if col in matched.columns
+    ]
 
     print()
     print("=" * 100)
-    print("SHARED EXPERIMENTAL STRATA")
+    print("KEY PROCESS VARIABLE SUPPORT")
     print("=" * 100)
 
-    for i, sig in enumerate(sorted(shared), 1):
-        c = control[
-            control["_signature"] == sig
+    rows = []
+
+    for feature in key_process_columns:
+        control_values = sorted(
+            controlled[feature]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        stressed_values = sorted(
+            stressed[feature]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        common_values = sorted(
+            set(control_values)
+            & set(stressed_values)
+        )
+
+        rows.append({
+            "feature": feature,
+            "controlled_values": str(control_values),
+            "stressed_values": str(stressed_values),
+            "shared_values": str(common_values),
+            "shared_value_count": len(common_values),
+        })
+
+        print()
+        print(feature)
+        print(f"  controlled: {control_values}")
+        print(f"  stressed:   {stressed_values}")
+        print(f"  shared:     {common_values}")
+
+    support_report = pd.DataFrame(rows)
+
+    output_rows = []
+
+    for sig in sorted(shared):
+        c = controlled[
+            controlled["_exact_signature"] == sig
         ]
 
         s = stressed[
-            stressed["_signature"] == sig
+            stressed["_exact_signature"] == sig
         ]
-
-        base = c.iloc[0]
 
         c_eff = pd.to_numeric(
             c["efficiency_%"],
@@ -236,61 +362,73 @@ def main():
         )
 
         row = {
-            "stratum": i,
-            "control_n": len(c),
+            "signature": int(sig),
+            "controlled_n": len(c),
             "stressed_n": len(s),
-            "control_eff_mean": c_eff.mean(),
-            "stressed_eff_mean": s_eff.mean(),
-            "eff_difference": (
+            "controlled_efficiency_mean": c_eff.mean(),
+            "stressed_efficiency_mean": s_eff.mean(),
+            "efficiency_difference": (
                 s_eff.mean() - c_eff.mean()
             ),
         }
 
-        for col in [
-            "solution_ph",
-            "dye_conc_mg/l",
-            "light_intensity_watt",
-            "light_source_dist_cm",
-            "loading_g",
-            "volume_l",
-        ]:
-            if col in matched.columns:
-                row[col] = base[col]
+        output_rows.append(row)
 
-        rows.append(row)
+    overlap_report = pd.DataFrame(output_rows)
 
-    report = pd.DataFrame(rows)
+    if overlap_report.empty:
+        overlap_report = pd.DataFrame(
+            columns=[
+                "signature",
+                "controlled_n",
+                "stressed_n",
+                "controlled_efficiency_mean",
+                "stressed_efficiency_mean",
+                "efficiency_difference",
+            ]
+        )
 
-    print(report.to_string(index=False))
-
-    report.to_csv(
+    overlap_report.to_csv(
         OUTPUT,
+        index=False,
+    )
+
+    support_report.to_csv(
+        RESULTS / "matrix_process_support_audit.csv",
         index=False,
     )
 
     print()
     print("=" * 100)
-    print("OVERLAP EFFICIENCY SUMMARY")
+    print("SCIENTIFIC INTERPRETATION")
     print("=" * 100)
 
-    print(
-        f"Controlled mean efficiency: "
-        f"{pd.to_numeric(exact_control['efficiency_%'], errors='coerce').mean():.4f}"
-    )
-
-    print(
-        f"Stressed mean efficiency: "
-        f"{pd.to_numeric(exact_stressed['efficiency_%'], errors='coerce').mean():.4f}"
-    )
+    if len(shared) == 0:
+        print(
+            "No exact controlled/stressed pairs exist after holding "
+            "all recorded non-matrix experimental variables fixed."
+        )
+        print()
+        print(
+            "Therefore AquaFetch dye_removal should NOT be used as "
+            "the primary clean water-matrix domain-adaptation benchmark."
+        )
+        print()
+        print(
+            "It remains useful as an observational/confounded "
+            "stress-test or secondary reliability dataset."
+        )
+    else:
+        print(
+            "Exact non-matrix overlap exists. These shared strata "
+            "can be investigated as a small controlled matrix-shift subset."
+        )
 
     print()
-    print(f"Saved: {OUTPUT}")
-
-    print()
+    print(f"Overlap report: {OUTPUT}")
     print(
-        "This audit does not train a model. "
-        "It tests whether water-matrix stress is identifiable "
-        "independently of the other recorded process variables."
+        f"Process-support report: "
+        f"{RESULTS / 'matrix_process_support_audit.csv'}"
     )
 
 
