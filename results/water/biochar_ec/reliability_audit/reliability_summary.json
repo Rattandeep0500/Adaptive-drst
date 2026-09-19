@@ -1,0 +1,27 @@
+{
+  "source_domain": "Lake water",
+  "target_domain": "Secondary effluent",
+  "source_conditions": 322,
+  "target_conditions": 140,
+  "source_oof_mae": 5.315169504083219,
+  "target_baseline": {
+    "n": 140,
+    "mae": 10.43258777001123,
+    "rmse": 16.689849821312908,
+    "r2": 0.9105205381971229,
+    "spearman": 0.8325877944482648,
+    "mean_error": 6.501394434575173
+  },
+  "domain_auc": 0.8254214729370009,
+  "source_oob_risk_spearman": 0.7705344461615353,
+  "target_risk_spearman": 0.6134831952067527,
+  "source_error_median": 0.8795719921198071,
+  "source_error_q75": 4.532357386759063,
+  "target_risk_auc_median": 0.7210666666666666,
+  "target_risk_auc_q75": 0.8147229114971052,
+  "low_risk_quartile_mae": 3.996458305813466,
+  "high_risk_quartile_mae": 20.838249328436962,
+  "high_low_risk_mae_ratio": 5.21417908905105,
+  "supported_target_mae": 11.482721228217148,
+  "unsupported_target_mae": 6.888387348566257
+}
