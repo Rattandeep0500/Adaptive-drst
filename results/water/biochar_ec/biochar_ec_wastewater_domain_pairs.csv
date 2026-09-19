@@ -1,0 +1,7 @@
+domain_a,domain_b,n_a,n_b,adsorbents_a,adsorbents_b,shared_adsorbents,adsorbent_jaccard,pollutants_a,pollutants_b,shared_pollutants,pollutant_jaccard,shared_exact_nonmatrix_signatures,rows_a_in_exact_overlap,rows_b_in_exact_overlap
+Lake water,Ground water,693,252,5,3,3,0.6,4,1,1,0.25,142,252,252
+Lake water,Secondary effluent,693,486,5,2,2,0.4,4,4,4,1.0,108,369,390
+Secondary effluent,Ground water,486,252,2,3,0,0.0,4,1,1,0.25,0,0,0
+Synthetic,Lake water,2326,693,10,5,0,0.0,10,4,0,0.0,0,0,0
+Synthetic,Secondary effluent,2326,486,10,2,0,0.0,10,4,0,0.0,0,0,0
+Synthetic,Ground water,2326,252,10,3,0,0.0,10,1,0,0.0,0,0,0
