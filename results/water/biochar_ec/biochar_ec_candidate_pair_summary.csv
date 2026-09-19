@@ -1,0 +1,3 @@
+source,target,source_conditions,target_conditions,shared_signatures,source_overlap_conditions,target_overlap_conditions,source_overlap_fraction,target_overlap_fraction,paired_mean_abs_shift,paired_median_abs_shift
+Lake water,Secondary effluent,322,140,108,108,108,0.33540372670807456,0.7714285714285715,9.863346271620369,4.969884432500002
+Lake water,Ground water,322,142,142,142,142,0.4409937888198758,1.0,3.1179251511619706,0.7078515274999999
