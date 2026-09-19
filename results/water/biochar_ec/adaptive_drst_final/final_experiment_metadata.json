@@ -1,0 +1,47 @@
+{
+  "source_domain": "Lake water",
+  "target_domains": [
+    "Secondary effluent",
+    "Ground water"
+  ],
+  "source_conditions": 322,
+  "features": [
+    "Adsorbent",
+    "Pyrolysis temperature ",
+    "Pyrolysis time",
+    "C",
+    "H",
+    "O",
+    "N",
+    "(O+N)/C",
+    "Ash",
+    "H/C",
+    "O/C",
+    "N/C",
+    "Surface area",
+    "Pore volume",
+    "Average pore size",
+    "Pollutant",
+    "Adsorption time",
+    "Initial concentration",
+    "Solution pH",
+    "RPM",
+    "Volume",
+    "Adsorbent dosage",
+    "Adsorption temperature",
+    "Ion concentration",
+    "Humic acid",
+    "Adsorption type"
+  ],
+  "strict_risk_features": [
+    "rf_tree_std",
+    "nn_distance_mean",
+    "local_label_std",
+    "nearest_source_label_gap",
+    "domain_target_probability",
+    "log_target_source_odds",
+    "unsupported_flag"
+  ],
+  "target_labels_used_for_training": false,
+  "prediction_magnitude_in_primary_risk_model": false
+}

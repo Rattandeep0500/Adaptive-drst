@@ -1,0 +1,8 @@
+feature,importance
+rf_tree_std,0.6283584716318625
+nearest_source_label_gap,0.165483142706324
+local_label_std,0.1543377508052568
+nn_distance_mean,0.036260503254134796
+log_target_source_odds,0.007788257654562994
+domain_target_probability,0.007726793068570321
+unsupported_flag,4.508087928870595e-05
